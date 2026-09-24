@@ -418,6 +418,73 @@ def main() -> int:
         "SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == 0
     print("case 11 rolling 24h GPU-minute budgets OK")
 
+    # --- Case 12: dependency revision on queued jobs -----------------------
+    db.reset_for_tests()
+    db.connect(":memory:")
+    p1 = submit("a", 1, 10, 1.0, iso(0))                     # J000001
+    p2 = submit("a", 1, 10, 1.0, iso(1))                     # J000002
+    dep = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[p1["id"]])
+    db.get_conn().execute(
+        "UPDATE jobs SET queued_at = ? WHERE id = ?", (iso(2), dep["id"]))
+    jx = submit("c", 1, 10, 1.0, iso(3))                     # J000004
+
+    # Wholesale replacement: deduplicated, sorted, cross-tenant.
+    rev = scheduler.revise_dependencies(dep["id"], [jx["id"], p2["id"], jx["id"]])
+    assert rev["depends_on"] == [p2["id"], jx["id"]]
+    assert rev["blocked_by"] == [
+        {"id": p2["id"], "status": "QUEUED"},
+        {"id": jx["id"], "status": "QUEUED"},
+    ]
+
+    # Rejections leave the stored edges untouched.
+    for bad, needle in (
+        (["J000999"], "unknown depends_on"),
+        ([dep["id"]], "dependency cycle"),
+    ):
+        try:
+            scheduler.revise_dependencies(dep["id"], bad)
+        except scheduler.SchedulerError as e:
+            assert needle in str(e)
+        else:
+            raise AssertionError(f"revision {bad} should be rejected")
+    # A cycle through the replacement is rejected too (p2 is a prereq of dep).
+    try:
+        scheduler.revise_dependencies(p2["id"], [dep["id"]])
+    except scheduler.SchedulerError as e:
+        assert "dependency cycle" in str(e)
+    else:
+        raise AssertionError("cycle-closing revision should be rejected")
+    assert scheduler.get_job(dep["id"])["depends_on"] == [p2["id"], jx["id"]]
+
+    # Empty list detaches; the next preview/batch judge the new edges.
+    rev = scheduler.revise_dependencies(dep["id"], [])
+    assert rev["depends_on"] == [] and rev["blocked_by"] == []
+    p = scheduler.preview_batch(now=at(10))
+    assert p["selection_order"] == [p1["id"], dep["id"], jx["id"], p2["id"]], \
+        p["selection_order"]
+    r = scheduler.run_batch(now=at(10))
+    assert r["selection_order"] == [p1["id"], dep["id"], jx["id"], p2["id"]]
+
+    # Only QUEUED jobs can be revised.
+    try:
+        scheduler.revise_dependencies(dep["id"], [])
+    except scheduler.Conflict:
+        pass
+    else:
+        raise AssertionError("RUNNING job revision should be rejected")
+
+    # The submission-time idempotency fingerprint is preserved: replaying the
+    # original request returns the revised job without restoring old edges.
+    job, created = scheduler.submit_job_idempotent(
+        "d", 1, 10, 1.0, [p1["id"]], idempotency_key="rev-key")
+    assert created and job["depends_on"] == [p1["id"]]
+    scheduler.revise_dependencies(job["id"], [])
+    replay, created2 = scheduler.submit_job_idempotent(
+        "d", 1, 10, 1.0, [p1["id"]], idempotency_key="rev-key")
+    assert not created2
+    assert replay["id"] == job["id"] and replay["depends_on"] == []
+    print("case 12 dependency revision OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

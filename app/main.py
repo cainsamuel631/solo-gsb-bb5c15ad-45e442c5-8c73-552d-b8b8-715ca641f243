@@ -121,6 +121,27 @@ class JobIn(BaseModel):
         return value
 
 
+class JobDependenciesIn(BaseModel):
+    depends_on: list[str] = Field(
+        ...,
+        description=(
+            "Full replacement set of prerequisite job ids (cluster-global; "
+            "cross-tenant allowed). Deduplicated and sorted by job id; send "
+            "an empty array to detach the job from all prerequisites. "
+            "Unknown ids, self-dependence and replacement-induced cycles "
+            "are rejected and leave the current dependencies unchanged."
+        ),
+        examples=[["J000001", "J000002"]],
+    )
+
+    @field_validator("depends_on")
+    @classmethod
+    def _non_empty_dependency_ids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(d, str) or not d.strip() for d in value):
+            raise ValueError("depends_on entries must be non-empty strings")
+        return value
+
+
 class BatchIn(BaseModel):
     now: datetime | None = Field(
         default=None,
@@ -283,6 +304,25 @@ def get_job(job_id: str):
         return scheduler.get_job(job_id)
     except SchedulerError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
+@app.patch("/jobs/{job_id}/dependencies", tags=["jobs"])
+def revise_job_dependencies(job_id: str, body: JobDependenciesIn):
+    """Atomically replace a QUEUED job's prerequisite set.
+
+    The body's ``depends_on`` array substitutes every existing edge (send
+    ``[]`` to detach the job from all prerequisites); ids are deduplicated
+    and sorted, and cross-tenant prerequisites are allowed. Unknown ids,
+    self-dependence and replacement-induced cycles are rejected (400) with
+    the stored dependencies left unchanged; a non-QUEUED job gets 409 and
+    an unknown job 404. The revision commits under the same lock and
+    write-transaction style as batch scheduling, so the next preview or
+    committed batch already judges the new edges. The first submission's
+    idempotency fingerprint is preserved: replaying the original
+    ``POST /jobs`` request returns this job's current (revised) object
+    without restoring the original dependencies.
+    """
+    return scheduler.revise_dependencies(job_id, body.depends_on)
 
 
 @app.post("/jobs/{job_id}/cancel", tags=["jobs"])
