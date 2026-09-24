@@ -110,6 +110,27 @@ CANCELLED prerequisite can never complete: dependents stay QUEUED forever
 and ``blocked_by`` (on the job object and in ``GET /queue``) reports the
 prerequisite id together with its current status.
 
+Dependency revision
+===================
+While a job is still QUEUED its whole prerequisite set can be replaced
+atomically via ``revise_dependencies`` (``PATCH /jobs/{id}/dependencies``):
+the supplied ``depends_on`` array — deduplicated and sorted by job id,
+exactly like at submission — becomes the job's new edge set, and an empty
+array detaches every dependency. References are cluster-global (cross-tenant
+allowed). Only QUEUED jobs may be revised (anything else is a 409); unknown
+ids, self-dependence and any replacement that would close a dependency cycle
+are rejected (400) and, because the edge swap and the cycle check share one
+write transaction that rolls back on error, the original dependencies survive
+every rejection unchanged. The revision runs under the same process-wide lock
+and ``BEGIN IMMEDIATE`` write transaction as a scheduling batch, so a batch
+always decides on a consistent graph; the next preview and the next committed
+batch both judge readiness by the revised edges. A successful revision
+returns the job object with the fresh ``depends_on``/``blocked_by``. The
+idempotency fingerprint recorded at first submission is deliberately NOT
+rewritten: a later retry of the original ``POST /jobs`` request still matches
+that fingerprint and simply returns the job's current object — revised
+dependencies included — without resetting them.
+
 Idempotent submission
 =====================
 ``POST /jobs`` accepts an optional ``Idempotency-Key`` request header. A
@@ -126,6 +147,11 @@ that record *before any write*, so it returns the job's **current** object
 (the job may since have been dispatched, completed or cancelled) and never
 updates the tenant weight, ``updated_at``, the job's ``queued_at`` or its
 dependencies; the HTTP layer answers such a replay with 200 rather than 201.
+The fingerprint is the one recorded at first submission and is never
+rewritten — in particular a later dependency revision
+(``revise_dependencies``) leaves it untouched, so a replay with the original
+parameters returns the job with its *revised* dependencies instead of
+restoring the submitted ones.
 The same key reused with different fingerprint parameters is rejected with
 409.
 
@@ -885,6 +911,94 @@ def complete_job(job_id: str) -> dict[str, Any]:
             "UPDATE jobs SET status = ?, completed_at = ? WHERE id = ?",
             (COMPLETED, now, job_id),
         )
+        return _get_job_or_404(conn, job_id)
+
+
+def revise_dependencies(
+    job_id: str, depends_on: list[str]
+) -> dict[str, Any]:
+    """Atomically replace a QUEUED job's whole prerequisite set.
+
+    ``depends_on`` is the full replacement (PATCH semantics): it is
+    normalised exactly like at submission — entries must be non-empty id
+    strings, duplicates are removed and the result is stored sorted by job
+    id — and an empty list detaches every dependency. Prerequisites are
+    cluster-global: jobs of ANY tenant may be referenced.
+
+    Only a QUEUED job may be revised; anything else raises 409. Unknown
+    prerequisite ids, self-dependence and a replacement that would close a
+    dependency cycle raise 400. The edge swap and the whole-graph cycle
+    check run inside the same ``BEGIN IMMEDIATE`` write transaction that
+    serialises against scheduling batches via the process-wide lock, and any
+    rejection rolls that transaction back, so the original dependencies
+    survive every failed revision unchanged. On success the next preview and
+    the next committed batch judge readiness by the new edges, and the
+    returned job object carries the fresh ``depends_on``/``blocked_by``.
+
+    The ``idempotent_jobs`` fingerprint recorded at first submission is
+    deliberately left untouched: a later retry of the original submission
+    still matches it and returns this job's current object — revised
+    dependencies included — without restoring the submitted ones.
+    """
+    if not isinstance(depends_on, list) or any(
+        not isinstance(d, str) or not d.strip() for d in depends_on
+    ):
+        raise SchedulerError(
+            "depends_on must be a list of non-empty job id strings"
+        )
+    # Same normalised form as a submission: deduplicated, id-sorted.
+    depends_on = sorted(set(depends_on))
+
+    with db.get_lock(), db.get_conn():
+        conn = db.get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"job '{job_id}' not found")
+        if row["status"] != QUEUED:
+            raise Conflict(
+                f"job '{job_id}' is {row['status'].lower()}; dependencies "
+                "can only be revised while the job is queued"
+            )
+        if job_id in depends_on:
+            raise SchedulerError(
+                f"job '{job_id}' cannot depend on itself"
+            )
+        # Prerequisites may belong to ANY tenant (dependencies are
+        # cluster-global), but every referenced id must exist.
+        if depends_on:
+            placeholders = ",".join("?" for _ in depends_on)
+            found = {
+                r["id"] for r in conn.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({placeholders})",
+                    depends_on,
+                ).fetchall()
+            }
+            missing = [d for d in depends_on if d not in found]
+            if missing:
+                raise SchedulerError(
+                    f"unknown depends_on job id(s): {', '.join(missing)}"
+                )
+
+        # Tentatively swap the edge set, then validate the graph the swap
+        # produces. Raising on a cycle rolls the whole transaction back, so
+        # the original edges are restored together with everything else.
+        conn.execute(
+            "DELETE FROM job_dependencies WHERE job_id = ?", (job_id,)
+        )
+        for prereq in depends_on:
+            conn.execute(
+                "INSERT INTO job_dependencies (job_id, depends_on) "
+                "VALUES (?, ?)",
+                (job_id, prereq),
+            )
+        cycle = _find_cycle(conn)
+        if cycle is not None:
+            raise SchedulerError(
+                "dependency cycle detected: " + " -> ".join(cycle)
+            )
         return _get_job_or_404(conn, job_id)
 
 

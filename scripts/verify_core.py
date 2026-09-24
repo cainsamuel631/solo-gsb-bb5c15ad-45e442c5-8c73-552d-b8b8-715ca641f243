@@ -418,6 +418,56 @@ def main() -> int:
         "SELECT COUNT(*) AS n FROM batches").fetchone()["n"] == 0
     print("case 11 rolling 24h GPU-minute budgets OK")
 
+    # --- Case 12: dependency revision (wholesale replace, QUEUED only) -----
+    db.reset_for_tests()
+    db.connect(":memory:")
+    pre = submit("a", 1, 10, 1.0, iso(0))                    # J000001
+    job = scheduler.submit_job("b", 1, 10, 1.0, depends_on=[pre["id"]])
+    other = scheduler.submit_job("c", 1, 10, 1.0)            # J000003
+
+    # Wholesale replace: deduplicated, id-sorted, cross-tenant allowed.
+    revised = scheduler.revise_dependencies(
+        job["id"], [other["id"], pre["id"], other["id"]])
+    assert revised["depends_on"] == [pre["id"], other["id"]]
+    assert revised["blocked_by"] == [
+        {"id": pre["id"], "status": "QUEUED"},
+        {"id": other["id"], "status": "QUEUED"},
+    ]
+
+    # Unknown id, self-dependence and cycles are rejected, and every
+    # rejection leaves the original edges untouched.
+    for bad in (["J000999"], [job["id"]]):
+        try:
+            scheduler.revise_dependencies(job["id"], bad)
+        except scheduler.SchedulerError:
+            pass
+        else:
+            raise AssertionError(f"{bad} should be rejected")
+    try:
+        scheduler.revise_dependencies(pre["id"], [job["id"]])
+    except scheduler.SchedulerError as e:
+        assert "cycle" in str(e)
+    else:
+        raise AssertionError("cycle should be rejected")
+    assert scheduler.get_job(job["id"])["depends_on"] == [
+        pre["id"], other["id"]]
+    assert scheduler.get_job(pre["id"])["depends_on"] == []
+
+    # Empty array detaches everything; the next batch uses the new graph.
+    assert scheduler.revise_dependencies(job["id"], [])["depends_on"] == []
+    r = scheduler.run_batch(now=at(5))
+    assert r["selection_order"] == ["J000001", "J000002", "J000003"], \
+        r["selection_order"]
+
+    # Only QUEUED jobs can be revised.
+    try:
+        scheduler.revise_dependencies(job["id"], [])
+    except scheduler.Conflict:
+        pass
+    else:
+        raise AssertionError("RUNNING job revision should be rejected")
+    print("case 12 dependency revision OK")
+
     print("\nALL CORE CHECKS PASSED")
     return 0
 

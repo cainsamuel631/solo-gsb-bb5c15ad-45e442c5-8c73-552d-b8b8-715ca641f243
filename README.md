@@ -176,6 +176,34 @@ RUNNING 作业占用 GPU，直到 `complete`/`cancel` 才释放给后续批次�
   - `depends_on`：全部前置作业 id（去重、按 id 排序）；
   - `blocked_by`：尚未 COMPLETED 的前置作业 `[{id, status}]`，仅对 QUEUED 作业有意义，空数组表示立即可调度。
 
+### 依赖修订（`PATCH /jobs/{id}/dependencies`，仅 QUEUED）
+
+排队中的作业可以**整体替换**其前置作业集合：
+
+- 请求体的 `depends_on` 数组**全量替换**现有前置（与提交时同样**去重并按作业 id
+  排序**）；**空数组 `[]` 解除全部依赖**。引用仍是**集群级**的，允许跨租户。
+- **仅 QUEUED** 作业可修订：RUNNING/COMPLETED/CANCELLED → `409`；作业不存在 → `404`。
+- 校验失败 → `400` 且**原依赖保持不变**：未知前置 id、自依赖、或替换后形成依赖环
+  （边替换与全图成环检查在同一写事务内，失败整体回滚）。
+- 修订与批次调度**共用同一进程写锁与 `BEGIN IMMEDIATE` SQLite 写事务**，批次永远
+  基于一致的依赖图决策；成功响应返回含最新 `depends_on` / `blocked_by` 的作业对象，
+  **下一次预演 `/scheduler/preview` 与正式批次 `/scheduler/batch` 即按新依赖判断**。
+- **幂等指纹不受影响**：首次提交保存的 `Idempotency-Key` 指纹不会被修订改写；之后
+  用原参数重试 `POST /jobs` 仍命中原指纹（200），返回的是**修订后**的作业当前对象，
+  不会把依赖重置回提交时的值。
+
+```bash
+curl -X PATCH http://localhost:8000/jobs/J000004/dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{"depends_on":["J000002","J000001","J000002"]}'
+# 200 {"id":"J000004","status":"QUEUED","depends_on":["J000001","J000002"],
+#      "blocked_by":[{"id":"J000001","status":"RUNNING"}, ...], ...}
+
+curl -X PATCH http://localhost:8000/jobs/J000004/dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{"depends_on":[]}'        # 空数组：解除全部依赖
+```
+
 ### GPU 维护时段（`maintenance_windows`，持久化）
 
 可创建**持久化的 GPU 维护时段**：每段是一个 **UTC 半开区间 `[start_at, end_at)`**，
@@ -361,6 +389,37 @@ curl -X POST http://localhost:8000/jobs \
 #      "depends_on":["J000001"],
 #      "blocked_by":[{"id":"J000001","status":"QUEUED"}], ...}
 ```
+
+### 1b. 修订排队作业的依赖 `PATCH /jobs/{id}/dependencies`
+
+整体替换一个 **QUEUED** 作业的前置作业集合（详见上文「依赖修订」一节）：
+
+```bash
+# 全量替换为新的前置集合（自动去重、按 id 排序；允许跨租户引用）
+curl -X PATCH http://localhost:8000/jobs/J000002/dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{"depends_on":["J000003","J000001"]}'
+# 200 {"id":"J000002","depends_on":["J000001","J000003"],
+#      "blocked_by":[{"id":"J000001","status":"RUNNING"}, ...], ...}
+
+# 空数组解除全部依赖，下一次预演/正式批次即可调度
+curl -X PATCH http://localhost:8000/jobs/J000002/dependencies \
+  -H 'Content-Type: application/json' \
+  -d '{"depends_on":[]}'
+```
+
+| 情形 | 状态码 | 说明 |
+|---|---|---|
+| 成功 | 200 | 返回含最新 `depends_on` / `blocked_by` 的作业对象 |
+| 作业不存在 | 404 | — |
+| 作业非 QUEUED | 409 | RUNNING/COMPLETED/CANCELLED 不可修订 |
+| 未知前置 id / 自依赖 / 替换后成环 | 400 | **原依赖保持不变**（同一写事务整体回滚） |
+| 请求体缺 `depends_on`、类型错误或含空白字符串 | 422 | — |
+
+修订与批次调度共用同一写锁与 SQLite 写事务；成功后的**下一次
+`/scheduler/preview` 与 `/scheduler/batch`** 立即按新依赖判定。首次提交的
+`Idempotency-Key` 指纹不会被修订改写：用原参数重试 `POST /jobs` 仍返回 200 与
+**修订后**的作业对象，不会重置依赖。
 
 ### 2. 调度下一批 `POST /scheduler/batch`
 
@@ -604,6 +663,7 @@ curl -s -X POST localhost:8000/scheduler/batch \
 | POST | `/jobs` | 提交作业（自动注册/更新租户权重，支持 `depends_on` 依赖）；可选请求头 **`Idempotency-Key`** 实现按 `tenant_id + key` 的幂等提交（首次 201、同参重试 200 返回作业当前对象且无副作用、异参 409、失败不占 key），不传则沿用原接口 |
 | GET | `/jobs` | 列作业（可选 `status`、`tenant_id`） |
 | GET | `/jobs/{id}` | 作业详情 |
+| PATCH | `/jobs/{id}/dependencies` | **整体替换 QUEUED 作业的前置依赖**（`depends_on` 全量替换、去重排序、空数组解除全部、跨租户允许）；未知 id/自依赖/成环 → 400 且原依赖不变，非 QUEUED → 409；下一次预演与正式批次按新依赖判断；保留首次提交的幂等指纹 |
 | POST | `/jobs/{id}/cancel` | 取消作业 |
 | POST | `/jobs/{id}/complete` | 完成运行中作业并释放 GPU |
 | POST | `/tenants` | 创建租户或更新权重；可选 `max_gpus` 设置/更新/清除并发 GPU 上限，可选 `budget_gpu_min` 设置/更新/清除滚动 24h GPU-分钟预算（省略保留、null 清除） |
@@ -646,6 +706,12 @@ curl -s -X POST localhost:8000/jobs -H 'Content-Type: application/json' \
 curl -s -X POST localhost:8000/scheduler/batch        # => []（J000003 仍 RUNNING，dave 不消耗量子）
 curl -s localhost:8000/jobs/J000004                   # blocked_by 标明 J000003/RUNNING
 curl -s -X POST localhost:8000/jobs/J000003/complete
+
+# 依赖修订（仅 QUEUED）：J000004 仍在排队时可整体替换前置集合，空数组直接解除；
+# 下一次预演/正式批次即按新依赖判断
+curl -s -X PATCH localhost:8000/jobs/J000004/dependencies \
+  -H 'Content-Type: application/json' -d '{"depends_on":[]}'
+curl -s -X POST localhost:8000/scheduler/batch        # => [J000004]（依赖已解除）
 
 # 租户并发 GPU 上限：team-c 上限 2，其 2-GPU 作业可派发，后续作业被本租户上限挡住，
 # 但其他租户不受影响
@@ -698,7 +764,7 @@ curl -s -G localhost:8000/maintenance-windows \
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（116 个：服务层算法/依赖/用量汇总/租户 GPU 上限/滚动 24h
+# 运行全部测试（139 个：服务层算法/依赖/依赖修订/用量汇总/租户 GPU 上限/滚动 24h
 # GPU-分钟预算/批次预演/GPU 维护时段/POST /jobs 幂等提交 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
@@ -715,8 +781,8 @@ CLUSTER_GPUS=8 .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 app/
   config.py       # 环境变量配置
   db.py           # SQLite 连接、schema（tenants/jobs/batches/ledger/job_dependencies/idempotent_jobs/maintenance_windows，含旧库补列迁移）
-  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段 + 租户上限/24h 预算准入 + 幂等提交，框架无关）
-  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头）
+  scheduler.py    # 公平排队核心（WDRR + 老化 + 维护时段 + 租户上限/24h 预算准入 + 幂等提交 + 依赖修订，框架无关）
+  main.py         # FastAPI 路由与请求模型（POST /jobs 可选 Idempotency-Key 请求头；PATCH /jobs/{id}/dependencies 修订依赖）
 scripts/
   verify_core.py  # 零依赖核心算法验证
 tests/
@@ -725,6 +791,7 @@ tests/
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致
   test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业
+  test_dependencies_revision.py  # PATCH /jobs/{id}/dependencies：整体替换/解除、QUEUED 限定、未知/自依赖/成环拒绝且原依赖不变、预演与批次按新依赖、幂等指纹保留
   test_api.py          # HTTP 端到端测试
 Dockerfile
 docker-compose.yml

@@ -121,6 +121,28 @@ class JobIn(BaseModel):
         return value
 
 
+class JobDependenciesIn(BaseModel):
+    depends_on: list[str] = Field(
+        ...,
+        description=(
+            "Full replacement set of prerequisite job ids (cluster-global; "
+            "cross-tenant allowed). Deduplicated and sorted by job id; an "
+            "empty array detaches every dependency. Only QUEUED jobs may be "
+            "revised; unknown ids, self-dependence and replacements that "
+            "would close a dependency cycle are rejected and leave the "
+            "existing dependencies unchanged."
+        ),
+        examples=[["J000001"]],
+    )
+
+    @field_validator("depends_on")
+    @classmethod
+    def _non_empty_dependency_ids(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(d, str) or not d.strip() for d in value):
+            raise ValueError("depends_on entries must be non-empty strings")
+        return value
+
+
 class BatchIn(BaseModel):
     now: datetime | None = Field(
         default=None,
@@ -281,6 +303,27 @@ def list_jobs(
 def get_job(job_id: str):
     try:
         return scheduler.get_job(job_id)
+    except SchedulerError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+
+@app.patch("/jobs/{job_id}/dependencies", tags=["jobs"])
+def revise_job_dependencies(job_id: str, body: JobDependenciesIn):
+    """Atomically replace a QUEUED job's prerequisite set.
+
+    ``depends_on`` is the full replacement set (deduplicated, sorted by job
+    id; ``[]`` detaches every dependency); cross-tenant references are
+    allowed. Returns the job with its fresh ``depends_on``/``blocked_by``;
+    the next preview and committed batch judge readiness by the new edges.
+    Unknown job -> 404; job not QUEUED -> 409; unknown prerequisite id,
+    self-dependence or a replacement closing a dependency cycle -> 400, with
+    the original dependencies left untouched. The idempotency fingerprint of
+    the first submission is preserved, so a later retry of the original
+    ``POST /jobs`` returns the revised job without resetting its
+    dependencies.
+    """
+    try:
+        return scheduler.revise_dependencies(job_id, body.depends_on)
     except SchedulerError as e:
         raise HTTPException(status_code=e.status_code, detail=str(e))
 
